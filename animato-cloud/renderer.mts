@@ -71,15 +71,17 @@ const DEFAULT_YT_CLIENT_ID = '592242596648-am9pri2j11vmu44fdc6oau5p34aklkj8.apps
 // API keys are never stored in the render repository: the app sends them in
 // every dispatch (auth.*), or they come from repository secrets.
 
-const DIMENSIONS: Record<string, [number, number]> = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080], '4:3': [1440, 1080] };
+const DIMENSIONS: Record<string, [number, number]> = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080], '4:3': [1440, 1080], '4:5': [1080, 1350] };
 
 function resolveFormat(): { format: 'shorts' | 'video'; aspect: string } {
   const rawAspect = pick(JOB.aspect_ratio, INPUTS.aspect_ratio, ENV.ASPECT_RATIO, '9:16').replace('/', ':');
   let aspect = DIMENSIONS[rawAspect] ? rawAspect : '9:16';
   const rawFormat = pick(JOB.format, INPUTS.format, ENV.VIDEO_FORMAT).toLowerCase();
   const format: 'shorts' | 'video' = rawFormat === 'video' ? 'video' : rawFormat === 'shorts' ? 'shorts' : (aspect === '16:9' || aspect === '4:3' ? 'video' : 'shorts');
+  // A one-off music video or podcast from the app: the person chose the frame (TikTok 9:16, Instagram 4:5, YouTube 16:9) — use it as it is.
+  if (pick(JOB.studio_job, INPUTS.studio_job)) return { format, aspect };
   if (format === 'shorts' && (aspect === '16:9' || aspect === '4:3')) aspect = '9:16';
-  if (format === 'video' && (aspect === '9:16' || aspect === '1:1')) aspect = '16:9';
+  if (format === 'video' && (aspect === '9:16' || aspect === '1:1' || aspect === '4:5')) aspect = '16:9';
   return { format, aspect };
 }
 
@@ -257,7 +259,8 @@ let SOCIAL: Record<string, any> = {};
 // Studio animations on the Free plan render at 720p: about twice as fast, still sharp on a phone.
 const [W, H] = STUDIO?.fast ? (DIMENSIONS[CFG.aspect].map((v) => Math.round((v * 2) / 3 / 2) * 2) as [number, number]) : DIMENSIONS[CFG.aspect];
 const FRAME_W = W, FRAME_H = H;
-const FPS = 30;
+// Creative Studio videos (music videos, podcasts) are made at 24 frames a second: 20% fewer frames to draw, the same look on a phone.
+const FPS = STUDIO ? 24 : 30;
 /** Minutes left before GitHub stops the job (JOB_TIMEOUT_MINUTES, default 60, minus setup time already used). */
 const PROCESS_T0 = Date.now();
 const jobMinutesLeft = () => (parseInt(process.env.JOB_TIMEOUT_MINUTES || '60', 10) || 60) - 3 - (Date.now() - PROCESS_T0) / 60000;
@@ -2773,8 +2776,10 @@ async function renderWithStage(opts: {
   const audioExt = path.extname(opts.narration.audioPath) || '.mp3';
   const accent = CFG.category === 'cooking' ? '#FFB020' : CFG.category === 'tech' ? '#22D3EE' : CFG.category === 'news' ? '#FF4D4D' : '#FFD23F';
   // Musicals (a full concert, every frame) render at 75% size and are upscaled — about twice as fast.
-  const fast = !!opts.musicalStage && !opts.size && W * H > 1280 * 720;
-  const drawSize = fast ? { w: Math.round(W * 0.75 / 2) * 2, h: Math.round(H * 0.75 / 2) * 2 } : opts.size;
+  // Studio videos are drawn at 60-75% size and upscaled: far fewer pixels to draw and move for every frame.
+  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 0.75;
+  const fast = !!opts.musicalStage && !opts.size && (!!STUDIO || W * H > 1280 * 720);
+  const drawSize = fast ? { w: Math.round(W * drawScale / 2) * 2, h: Math.round(H * drawScale / 2) * 2 } : opts.size;
   const RW = drawSize?.w || W, RH = drawSize?.h || H;
   const job = {
     width: RW, height: RH, fps: FPS, duration: opts.duration, category: CFG.category,
@@ -3606,7 +3611,7 @@ async function writeMusicalSong(pastTitles: string[]): Promise<MusicalSong> {
     const repeated: MusicalSection[] = arranged.flatMap((s) => s.tag === 'chorus' ? [s, { ...s, emotion: s.emotion || 'excited' }] : [s]);
     const lyrics = cleanMusicLyrics(sectionLyricText(repeated));
     const firstLine = lines.find((x) => x && !/^\[/.test(x)) || 'Original song';
-    const title = clean(firstLine.replace(/^[^:]{1,24}:\s*/, '').replace(/[.!?].*$/, ''), 70) || 'Original song';
+    const title = String(firstLine.replace(/^[^:]{1,24}:\s*/, '').replace(/[.!?].*$/, '')).replace(/\s+/g, ' ').trim().slice(0, 70) || 'Original song';
     const gender = CFG.gender === 'male' ? 'male' : 'female';
     const style = String(CFG.subGenre || 'original music');
     return { title, description: `Original ${style} music video performed by a ${gender} lead singer.`, lyrics, sections: repeated, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
@@ -3747,64 +3752,119 @@ async function saveAceAudio(buf: Buffer, label: string) {
   if (fs.statSync(out).size < 10000) throw new PipelineError('acestep_busy', `ACE-Step (${label}) returned an empty audio clip.`);
   return { file: out, duration: await probeDuration(out) };
 }
-async function aceStepNative(song: MusicalSong, apiKey: string, fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
-  const r = aceStepRequest(song);
-  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8', 'User-Agent': 'curl/8.7.1' };
-  // "thinking" (the 5Hz planning LM) gives better songs but is slower; the retry rounds switch it off.
+/** Readable reason from an ACE cloud error body (JSON detail, or an HTML error page). */
+function aceReason(status: number, text: string): string {
+  try { const j = JSON.parse(text); const d = j?.detail || j?.error?.message || j?.error || j?.message; if (d) return String(typeof d === 'string' ? d : JSON.stringify(d)).slice(0, 240); } catch { /* not JSON */ }
+  if (/<html/i.test(text)) { const t = text.match(/<title>([^<]*)<\/title>/i)?.[1] || ''; return `${status === 504 || status === 524 ? 'the music cloud timed out' : 'the music cloud is unavailable'}${t ? ` (${t.trim().slice(0, 80)})` : ''}`; }
+  return text.replace(/\s+/g, ' ').trim().slice(0, 240) || `HTTP ${status}`;
+}
+const ACE_MODEL_GUESSES = ['acemusic/acestep-v1.5-turbo', 'acemusic/acestep-v15-turbo', ''];
+let aceModelId = '';
+/** The cloud lists its model at /v1/models; the first one listed is the one ACE's own client uses. */
+async function aceCloudModel(apiKey: string): Promise<string> {
+  if (CFG.acestepModel) return CFG.acestepModel;
+  if (aceModelId) return aceModelId;
+  try {
+    const r = await fetch(`${CFG.acestepBase}/v1/models`, { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json', 'User-Agent': 'curl/8.7.1' }, signal: AbortSignal.timeout(20000) });
+    const j: any = await r.json().catch(() => ({}));
+    const id = (Array.isArray(j?.data) ? j.data : []).map((m: any) => String(m?.id || '')).filter(Boolean)[0] || '';
+    if (id) { aceModelId = id; return id; }
+  } catch { /* use the guesses */ }
+  return ACE_MODEL_GUESSES[0];
+}
+type AceCall = { ok: true; buf: Buffer } | { ok: false; status: number; error: string };
+/** One request to the ACE Music cloud (OpenAI-style /v1/chat/completions). Streams so a long song is not cut by a gateway timeout. */
+async function aceCloudCall(apiKey: string, r: ReturnType<typeof aceStepRequest>, model: string, stream: boolean): Promise<AceCall> {
+  const lang = !r.lang || r.lang === 'pcm' || r.lang === 'unknown' ? 'en' : String(r.lang).slice(0, 8);
   const body: any = {
-    prompt: r.prompt, caption: r.prompt, lyrics: r.lyrics, audio_duration: r.target, audio_format: 'mp3', batch_size: 1, vocal_language: r.lang,
-    ...(r.bpm ? { bpm: r.bpm } : {}), ...(r.key ? { key_scale: r.key } : {}), time_signature: '4',
-    thinking: !fast, use_cot_caption: false, ai_token: apiKey, ...(CFG.acestepModel ? { model: CFG.acestepModel } : {}),
+    messages: [{ role: 'user', content: `<prompt>${String(r.prompt).slice(0, 500)}</prompt><lyrics>${r.lyrics || '[Instrumental]'}</lyrics>` }],
+    stream, thinking: false, use_format: false, sample_mode: false, use_cot_caption: false, use_cot_language: false,
+    audio_config: { duration: Math.max(20, Math.min(300, Math.round(r.target) || 60)), vocal_language: r.lyrics ? lang : 'en', format: 'mp3', ...(r.bpm ? { bpm: r.bpm } : {}), ...(r.lyrics ? {} : { instrumental: true }) },
   };
-  let taskId = '';
-  for (let attempt = 0; attempt < 3 && !taskId; attempt++) {
-    if (attempt) await sleep(8000 * attempt);
-    try {
-      const rel = await fetch(`${CFG.acestepBase}/release_task`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(180000) });
-      const txt = await rel.text();
-      let rj: any = {}; try { rj = JSON.parse(txt); } catch {}
-      taskId = String(rj?.data?.task_id || rj?.task_id || '').trim();
-      if (!rel.ok || !taskId) {
-        const code = aceErrCode(rel.status, txt);
-        const err = new PipelineError(code, `ACE-Step request failed (HTTP ${rel.status}): ${String(rj?.error || rj?.message || txt).slice(0, 200)}`);
-        if (code !== 'acestep_busy' || attempt === 2) throw err;
-        log(`⚠️ ${err.message} — retrying…`); taskId = '';
+  if (model) body.model = model;
+  let res: Response;
+  try {
+    res = await fetch(`${CFG.acestepBase}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8', Accept: stream ? 'text/event-stream' : 'application/json', 'User-Agent': 'curl/8.7.1' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(Math.max(60000, Math.min(12 * 60 * 1000, aceLeft()))),
+    });
+  } catch (e: any) { return { ok: false, status: 0, error: String(e?.message || e) }; }
+  if (!res.ok) { const t = await res.text().catch(() => ''); return { ok: false, status: res.status, error: aceReason(res.status, t) }; }
+  let url = '';
+  try {
+    if (/json/.test(res.headers.get('content-type') || '')) {
+      const j: any = await res.json().catch(() => ({}));
+      url = j?.choices?.[0]?.message?.audio?.[0]?.audio_url?.url || '';
+      if (!url) return { ok: false, status: 500, error: String(j?.detail || j?.error?.message || (j?.choices?.[0]?.finish_reason === 'error' ? j?.choices?.[0]?.message?.content : '') || 'the cloud answered without audio').slice(0, 300) };
+    } else {
+      // Server-sent events: heartbeats every few seconds, then a chunk carrying the audio, then [DONE].
+      const reader = res.body!.getReader(); const dec = new TextDecoder();
+      let buf = '', lastErr = '', lastBeat = 0;
+      const eat = (line: string) => {
+        line = line.trim();
+        if (!line.startsWith('data:')) return;
+        const data = line.slice(5).trim();
+        if (!data || data === '.' || data === '[DONE]') return;
+        try {
+          const j = JSON.parse(data);
+          const d = j?.choices?.[0]?.delta || j?.choices?.[0]?.message || {};
+          const u = d?.audio?.[0]?.audio_url?.url;
+          if (u) url = u;
+          if (j?.choices?.[0]?.finish_reason === 'error' || j?.error) lastErr = String(j?.error?.message || j?.error || d?.content || 'generation error');
+        } catch { /* partial line */ }
+      };
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        if (Date.now() - lastBeat > 15000) { lastBeat = Date.now(); void aceStatus('ACE Music cloud is composing'); }
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) { eat(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
       }
-    } catch (e: any) {
-      if (e instanceof PipelineError) throw e;
-      if (attempt === 2) throw new PipelineError('acestep_busy', `ACE-Step did not accept the song request (${e?.message || e}).`);
-      log(`⚠️ ACE-Step request attempt ${attempt + 1} failed (${e?.message || e}); retrying…`);
+      if (buf) eat(buf);
+      if (!url) return { ok: false, status: 500, error: lastErr || 'the stream ended without audio' };
     }
+  } catch (e: any) { return { ok: false, status: 0, error: `the song stream was interrupted (${e?.message || e})` }; }
+  const m = url.match(/^data:[^,]*;base64,(.+)$/s);
+  if (m) return { ok: true, buf: Buffer.from(m[1].replace(/\s+/g, ''), 'base64') };
+  if (!/^https?:/i.test(url)) return { ok: false, status: 500, error: 'unknown audio format' };
+  for (let d = 0; d < 3; d++) {
+    try {
+      const dl = await fetch(url, { headers: { 'User-Agent': 'curl/8.7.1' }, signal: AbortSignal.timeout(240000) });
+      if (!dl.ok) throw new Error(`HTTP ${dl.status}`);
+      return { ok: true, buf: Buffer.from(await dl.arrayBuffer()) };
+    } catch (e: any) { if (d === 2) return { ok: false, status: 500, error: `audio download failed: ${e?.message || e}` }; await sleep(4000); }
   }
-  log(`🎵 ACE-Step task ${taskId.slice(0, 24)} accepted${fast ? ' (fast mode)' : ''}; waiting for the song…`);
-  const started = Date.now();
-  for (let attempt = 0; Date.now() - started < Math.min(15 * 60 * 1000, aceLeft()); attempt++) {
-    await sleep(attempt < 15 ? 2500 : 5000);
-    let q: Response;
-    try { q = await fetch(`${CFG.acestepBase}/query_result`, { method: 'POST', headers, body: JSON.stringify({ task_id_list: [taskId] }), signal: AbortSignal.timeout(45000) }); }
-    catch { continue; }
-    const qj: any = await q.json().catch(() => ({}));
-    if (!q.ok) { if (q.status === 429 || q.status >= 500) continue; throw new PipelineError(aceErrCode(q.status, JSON.stringify(qj)), `ACE-Step status check failed (HTTP ${q.status}).`); }
-    const item = Array.isArray(qj?.data) ? qj.data[0] : Array.isArray(qj) ? qj[0] : qj?.data;
-    const status = Number(item?.status ?? 0);
-    if (status === 2) throw new PipelineError('acestep_busy', `ACE-Step could not generate the song: ${String(item?.error || item?.result || 'failed').slice(0, 200)}`);
-    if (status !== 1) { if (attempt % 8 === 0) log(`🎵 ACE-Step still generating (${Math.round((Date.now() - started) / 1000)}s)…`); continue; }
-    let res: any = item?.result;
-    if (typeof res === 'string') { try { res = JSON.parse(res); } catch { res = []; } }
-    const first = Array.isArray(res) ? res[0] : res;
-    const fileRef = String(first?.file || first?.audio_url || first?.url || '');
-    if (!fileRef) throw new PipelineError('acestep_busy', 'ACE-Step finished but returned no audio file.');
-    if (/^data:audio/i.test(fileRef)) return { ...(await saveAceAudio(Buffer.from(fileRef.split(',')[1] || '', 'base64'), 'async')), taskId };
-    const url = /^https?:\/\//i.test(fileRef) ? fileRef : `${CFG.acestepBase}${fileRef.startsWith('/') ? '' : '/'}${fileRef}`;
-    for (let d = 0; d < 3; d++) {
-      try {
-        const dl = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(240000) });
-        if (!dl.ok) throw new Error(`HTTP ${dl.status}`);
-        return { ...(await saveAceAudio(Buffer.from(await dl.arrayBuffer()), 'async')), taskId };
-      } catch (e: any) { if (d === 2) throw new PipelineError('acestep_busy', `ACE-Step audio download failed: ${e?.message || e}`); await sleep(5000); }
+  return { ok: false, status: 500, error: 'audio download failed' };
+}
+async function aceStepNative(song: MusicalSong, apiKey: string, _fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
+  const r = aceStepRequest(song);
+  let model = await aceCloudModel(apiKey);
+  let res: AceCall = { ok: false, status: 0, error: 'not started' };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { log(`⚠️ ACE Music cloud: ${(res as any).error} — retrying…`); await sleep(8000 * attempt); }
+    if (aceLeft() < 30000) break;
+    res = await aceCloudCall(apiKey, r, model, true);
+    // Wrong model name: try the other known names (and none), and remember the one that works.
+    if (!res.ok && [400, 404, 422].includes(res.status) && /model/i.test(res.error)) {
+      for (const alt of ACE_MODEL_GUESSES.filter((x) => x !== model)) {
+        res = await aceCloudCall(apiKey, r, alt, true);
+        if (res.ok || !/model/i.test(res.error)) { model = alt; aceModelId = alt; break; }
+      }
     }
+    // Streaming answered without audio or was cut: ask once the plain (non-streaming) way.
+    if (!res.ok && res.status !== 401 && res.status !== 403 && res.status !== 429 && res.status < 500 && res.status !== 404) {
+      const plain = await aceCloudCall(apiKey, r, model, false);
+      res = plain.ok ? plain : { ...plain, error: `${plain.error} (streaming: ${res.error})` };
+    }
+    if (res.ok) break;
+    // Only a busy / unreachable service is worth asking again with the same key.
+    if (aceErrCode(res.status, res.error) !== 'acestep_busy' && res.status !== 0) break;
   }
-  throw new PipelineError('acestep_busy', `ACE-Step task ${taskId} did not finish in time (${Math.round((Date.now() - started) / 60000)} min).`);
+  if (!res.ok) throw new PipelineError(res.status === 0 ? 'acestep_busy' : aceErrCode(res.status, res.error), `ACE Music cloud request failed (HTTP ${res.status || 'no answer'}): ${res.error}`);
+  const saved = await saveAceAudio(res.buf, 'cloud');
+  return { ...saved };
 }
 /** Google Lyria via the Gemini API (Interactions). PAID — only used when LYRIA_ENABLED=true and a billing-enabled Gemini key is set. */
 async function generateLyriaMusic(song: MusicalSong): Promise<{ file: string; duration: number; taskId?: string }> {
@@ -4079,12 +4139,90 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
   if (sections.length) sections[sections.length - 1].end = duration;
   return { words, sections };
 }
+/**
+ * Music video performed to the person's OWN song (Creative Studio → "Use my own music").
+ * The uploaded file is fetched from the app, trimmed to the video length limit (with a short fade-out when it is cut)
+ * and converted to a plain stereo WAV, then goes through exactly the same stem separation, lyric timing, singer
+ * lip-sync and band performance as an AI-composed song.
+ */
+async function loadUploadedSong(): Promise<{ file: string; duration: number; engine: string }> {
+  const S = STUDIO!;
+  if (!S.musicUrl) throw new PipelineError('music_missing', 'Your own song was selected, but no audio file arrived. Please upload it again.');
+  await reportStatus('running', '2/6 Preparing your song', 24, 'Loading your own music…');
+  const response = await fetch(`${CFG.appUrl.replace(/\/+$/, '')}${S.musicUrl}`, { headers: { 'X-Animato-Runner-Key': CFG.runnerKey } });
+  if (!response.ok) throw new PipelineError('music_fetch_failed', `Could not fetch your uploaded song (HTTP ${response.status}).`);
+  const raw = path.join(WORK_DIR, `own_song_${S.id}.audio`);
+  fs.writeFileSync(raw, Buffer.from(await response.arrayBuffer()));
+  const full = await probeDuration(raw);
+  if (!(full > 0)) throw new PipelineError('music_unreadable', 'Your uploaded file could not be read as audio. Try an MP3, M4A or WAV file.');
+  const limit = Math.max(15, Math.min(60, S.maxSeconds || 60));
+  const keep = Math.min(full, limit);
+  const out = path.join(WORK_DIR, `own_song_${S.id}.wav`);
+  const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-vn', '-t', keep.toFixed(2), '-ac', '2', '-ar', '44100'];
+  if (full > limit + 0.5) args.push('-af', `afade=t=out:st=${Math.max(0, keep - 1.5).toFixed(2)}:d=1.5`);
+  args.push('-c:a', 'pcm_s16le', out);
+  const r = await run('ffmpeg', args, { timeoutMs: 180000 });
+  if (r.code !== 0 || !fs.existsSync(out)) throw new PipelineError('music_unreadable', 'Your uploaded file could not be converted. Try an MP3, M4A or WAV file.');
+  const duration = await probeDuration(out);
+  if (duration < 5) throw new PipelineError('music_too_short', `Your song is only ${duration.toFixed(1)}s long — use a track of at least 5 seconds.`);
+  log(`🎵 Using the uploaded song: ${duration.toFixed(1)}s${full > limit + 0.5 ? ` (trimmed from ${full.toFixed(0)}s)` : ''}.`);
+  return { file: out, duration, engine: 'upload' };
+}
+/**
+ * Own song with NO lyrics typed in: build the lyric lines and sections from what was actually sung in the track
+ * (Whisper transcript of the isolated vocals), so the captions and singer timing still work.
+ * If nothing intelligible was heard (instrumental, or a language the transcriber could not read) the captions
+ * show a music note instead of made-up words.
+ */
+function songFromTranscript(words: Word[], title: string): MusicalSong {
+  const style = String(CFG.subGenre || 'original music');
+  const gender = CFG.gender === 'male' ? 'male' : 'female';
+  const lines: string[] = [];
+  let cur: string[] = [], prevEnd = -1;
+  const flush = () => { if (cur.length) lines.push(cur.join(' ')); cur = []; };
+  for (const w of words) {
+    const t = String(w.text || '').trim();
+    if (!t) continue;
+    if (cur.length && ((prevEnd >= 0 && w.start - prevEnd > 0.8) || cur.length >= 7)) flush();
+    cur.push(t); prevEnd = w.end;
+    if (/[.!?]$/.test(t) && cur.length >= 3) flush();
+  }
+  flush();
+  const calm = musicalProfile().emotion;
+  let sections: MusicalSection[];
+  if (words.length > 5 && lines.length >= 2) {
+    const key = (l: string) => l.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const counts = new Map<string, number>();
+    for (const l of lines) counts.set(key(l), (counts.get(key(l)) || 0) + 1);
+    sections = [];
+    for (let i = 0; i < lines.length; i += 4) {
+      const group = lines.slice(i, i + 4);
+      const repeated = group.some((l) => (counts.get(key(l)) || 0) >= 2);
+      sections.push({ tag: repeated ? 'chorus' : 'verse', lyrics: group.join('\n'), emotion: repeated ? 'excited' : calm });
+    }
+  } else {
+    log('🎵 No sung words could be made out in your song — the video will show a music note instead of lyrics.');
+    sections = [{ tag: 'verse', lyrics: '♪', emotion: calm }, { tag: 'chorus', lyrics: '♪', emotion: 'excited' }, { tag: 'verse', lyrics: '♪', emotion: calm }];
+  }
+  const firstLine = lines[0] || '';
+  const name = String(title || '').trim() || firstLine.replace(/[.!?,].*$/, '').slice(0, 70).trim() || 'My Music Video';
+  return { title: name.slice(0, 90), description: `Music video performed to the artist's own ${style} track by a ${gender} lead singer.`, lyrics: sectionLyricText(sections), sections, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
+}
 async function produceMusical(t0: number, pastTitles: string[]): Promise<number> {
   // Start installing / loading ACE-Step on this runner right away, while the lyrics are written.
-  await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
-  const song = await writeMusicalSong(pastTitles);
-  let generated = await generateMusicTrack(song);
-  const engineName = generated.engine === 'lyria' ? 'google-lyria' : 'ace-step-1.5';
+  const ownSong = STUDIO?.kind === 'musical' && STUDIO.musicMode === 'upload';
+  // Own song and no lyrics typed in: do not write a new song — the words are taken from the track itself below.
+  const lyricsFromTrack = ownSong && !cleanMusicLyrics(String(CFG.musicalLyrics || '')).trim();
+  let song: MusicalSong;
+  if (lyricsFromTrack) {
+    await reportStatus('running', '1/6 Getting ready', 10, 'Using your own song — the lyrics will be picked up from the track.');
+    song = songFromTranscript([], String(STUDIO?.title || ''));
+  } else {
+    await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
+    song = await writeMusicalSong(pastTitles);
+  }
+  let generated = ownSong ? await loadUploadedSong() : await generateMusicTrack(song);
+  const engineName = generated.engine === 'upload' ? 'user-upload' : generated.engine === 'lyria' ? 'google-lyria' : 'ace-step-1.5';
   let stems = await separateStems(generated.file, generated.duration);
   let vocalSpans = stems ? await vocalSpansOf(stems.vocals).catch(() => []) : [];
   // Voice check: the song must be sung by the singer the user chose (female / male).
@@ -4110,6 +4248,7 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   if (stems) log(`🎚 ${vocalSpans.length} sung phrases; drums level ${drumLevel.toFixed(2)}, keys/other level ${keysLevel.toFixed(2)}.`);
   // Transcribe the isolated vocals when we have them (far cleaner than the full mix).
   const transcript = await transcribeSong(stems?.vocals || generated.file);
+  if (lyricsFromTrack) song = songFromTranscript(transcript, String(STUDIO?.title || ''));
   const timing = timingForMusic(song, transcript, generated.duration, vocalSpans);
   if (!transcript.length && vocalSpans.length) log(`Lyric timing: no transcript — ${timing.words.length} words laid over ${vocalSpans.length} sung phrases.`);
   const cues = timing.sections.flatMap((sg) => [{ t: sg.start, tag: sg.emotion }, ...(sg.tag === 'chorus' ? [{ t: sg.start + 0.15, tag: 'excited' }] : [])]).filter((x) => EMOTION_TAGS.includes(x.tag));
@@ -4268,30 +4407,41 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
 /** Hand the finished video to the app in pieces (the app keeps it for 24 hours; the device keeps a copy). */
 async function studioDeliver(S: StudioJob, meta: { title: string; durationSec: number }) {
   const size = fs.statSync(OUTPUT_VIDEO).size;
-  const start = await appRequest('POST', `/api/animate/runner/${S.id}/upload`, { size }, 30000);
-  if (!start || start.status >= 300 || !start.data?.upload) throw new PipelineError('upload_failed', `The finished video could not be handed over (${start ? `HTTP ${start.status} ${start.data?.error || ''}` : 'app unreachable'}).`);
-  const up = start.data.upload, chunk = Number(up.chunkSize) || 6 * 1024 * 1024;
-  const n = Math.max(1, Math.ceil(size / chunk));
-  const etags: string[] = new Array(n).fill('');
-  const fd = fs.openSync(OUTPUT_VIDEO, 'r');
-  try {
-    for (let i = 0; i < n; i++) {
-      const len = Math.min(chunk, size - i * chunk);
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, i * chunk);
-      for (let a = 0; a < 5 && !etags[i]; a++) {
-        try {
-          const res = await fetch(`${CFG.appUrl}${up.base}/${i}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Animato-Runner-Key': CFG.runnerKey || '' }, body: buf, signal: AbortSignal.timeout(120000) });
-          const j: any = await res.json().catch(() => ({}));
-          if (res.ok && j.etag) etags[i] = String(j.etag); else await sleep(2000 * (a + 1));
-        } catch { await sleep(2000 * (a + 1)); }
+  let lastErr = '';
+  // The whole hand-over is retried (a fresh upload each time) so one bad moment on the app side does not lose a finished video.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { log(`⚠️ Delivery attempt ${attempt} failed (${lastErr}); starting the upload again…`); await sleep(3000 * attempt); }
+    const start = await appRequest('POST', `/api/animate/runner/${S.id}/upload`, { size }, 30000);
+    if (!start || start.status >= 300 || !start.data?.upload) { lastErr = `start: ${start ? `HTTP ${start.status} ${start.data?.error || ''}` : 'app unreachable'}`; continue; }
+    const up = start.data.upload, chunk = Number(up.chunkSize) || 6 * 1024 * 1024;
+    const n = Math.max(1, Math.ceil(size / chunk));
+    const etags: string[] = new Array(n).fill('');
+    const fd = fs.openSync(OUTPUT_VIDEO, 'r');
+    let failed = false;
+    try {
+      for (let i = 0; i < n && !failed; i++) {
+        const len = Math.min(chunk, size - i * chunk);
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, i * chunk);
+        let why = '';
+        for (let a = 0; a < 4 && !etags[i]; a++) {
+          try {
+            const res = await fetch(`${CFG.appUrl}${up.base}/${i}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Animato-Runner-Key': CFG.runnerKey || '' }, body: buf, signal: AbortSignal.timeout(120000) });
+            const j: any = await res.json().catch(() => ({}));
+            if (res.ok && j.etag) etags[i] = String(j.etag);
+            else { why = `HTTP ${res.status} ${j?.error || ''}`.trim(); if (res.status === 409) break; /* the app lost the upload record: start over */ await sleep(2000 * (a + 1)); }
+          } catch (e: any) { why = String(e?.message || e); await sleep(2000 * (a + 1)); }
+        }
+        if (!etags[i]) { lastErr = `piece ${i + 1}/${n}: ${why || 'no answer'}`; failed = true; break; }
+        await reportStatus('running', 'Delivering your animation', Math.min(99, 92 + Math.round((7 * (i + 1)) / n)), `Sent ${i + 1}/${n}.`);
       }
-      if (!etags[i]) throw new PipelineError('upload_failed', `Piece ${i + 1} of the video could not be sent.`);
-      await reportStatus('running', 'Delivering your animation', Math.min(99, 92 + Math.round((7 * (i + 1)) / n)), `Sent ${i + 1}/${n}.`);
-    }
-  } finally { fs.closeSync(fd); }
-  const done = await appRequest('POST', `/api/animate/runner/${S.id}/complete`, { parts: etags, size, width: W, height: H, ...meta }, 60000);
-  if (!done || done.status >= 300) throw new PipelineError('upload_failed', `The video could not be saved (${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}).`);
+    } finally { fs.closeSync(fd); }
+    if (failed) continue;
+    const done = await appRequest('POST', `/api/animate/runner/${S.id}/complete`, { parts: etags, size, width: W, height: H, ...meta }, 60000);
+    if (done && done.status < 300) return;
+    lastErr = `complete: ${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}`;
+  }
+  throw new PipelineError('upload_failed', `The finished video could not be delivered (${lastErr}).`);
 }
 
 async function applyStudioMusic(S: StudioJob, durationSec: number): Promise<void> {
@@ -4319,7 +4469,8 @@ async function produceStudio(t0: number): Promise<number> {
 
   // ---- One-off music video from Tools (never an automation episode) ----
   if (S.kind === 'musical') {
-    CFG.category = 'musical'; CFG.format = 'shorts'; CFG.aspect = '9:16';
+    // The frame (9:16, 4:5 or 16:9) was chosen in the app and is already applied; the song stays a short one.
+    CFG.category = 'musical'; CFG.format = 'shorts';
     CFG.musicalLyrics = String(S.script || '').slice(0, 3000);
     CFG.musicLanguage = S.musicLanguage || 'English'; CFG.subGenre = S.subGenre || 'afrobeats';
     CFG.stageId = S.stageMode === 'fixed' ? (S.stageId || 0) : 0;
@@ -4332,7 +4483,7 @@ async function produceStudio(t0: number): Promise<number> {
 
   // ---- One-off podcast from Tools (never an automation episode) ----
   if (S.kind === 'podcast') {
-    CFG.category = 'podcast'; CFG.format = 'video'; CFG.aspect = '16:9';
+    CFG.category = 'podcast'; CFG.format = CFG.aspect === '16:9' ? 'video' : 'shorts';
     CFG.podcastScript = String(S.script || '').slice(0, 8000);
     CFG.castSpecs = Array.isArray(S.podcastHosts) && S.podcastHosts.length ? S.podcastHosts : S.cast.map((c) => c.spec).filter(Boolean);
     CFG.studio = S.podcastStudio || CFG.studio;
@@ -4462,17 +4613,21 @@ async function studioWatermark() {
 
 /** The toolkit the 2D animation engine needs (shared by automations and Studio animations). */
 function animKit() {
-  const landscapePodcast = CFG.category === 'podcast' && H >= W;
+  // Automation podcasts are filmed landscape and placed in a vertical frame; a one-off podcast is drawn in the frame the person chose.
+  const landscapePodcast = CFG.category === 'podcast' && H >= W && !STUDIO;
   const RW = landscapePodcast ? 1920 : W, RH = landscapePodcast ? 1080 : H;
+  // Studio podcasts are drawn smaller and upscaled to the final frame (much faster, still sharp on a phone).
+  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 1;
+  const DW = STUDIO ? Math.round(RW * drawScale / 2) * 2 : RW, DH = STUDIO ? Math.round(RH * drawScale / 2) * 2 : RH;
   return {
     hostVoice: '',
-    CFG, W: RW, H: RH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
+    CFG, W: DW, H: DH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
     run: (cmd: string, args: string[], o: { timeoutMs?: number } = {}) => run(cmd, args, o),
     probeDuration, pastTitles: [] as string[], PipelineError,
     composeMusic: (mood: string, seconds: number, seed: string) => composeBuffers(mood as any, Math.max(10, seconds), seed),
     automateLevel, eqForVoice,
     runStage: (o: { stageFile: string; job: any; audioFinal: string; files: Record<string, string>; duration: number }) => runStage({
-      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: RW, h: RH },
+      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: DW, h: DH }, ...(STUDIO ? { scaleTo: { w: RW, h: RH } } : {}),
       audio: { inputs: ['-i', o.audioFinal], filter: '[1:a]aresample=48000,apad[aout]' }
     })
   };
